@@ -3,74 +3,69 @@ const WebSocket = require("ws");
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-const rooms = Object.create(null);
+const rooms = Object.create(null); // room -> { host: ws, clients: Map<id, ws> }
 const DEBUG = process.env.DEBUG_SIGNALING === "1";
 const INTERVAL_MS = 30000;
 
-function debugLog(...args) {
-  if (DEBUG) console.log(...args);
-}
+function debugLog(...args) { if (DEBUG) console.log(...args); }
 function safeSend(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
-function getRoomInfo(room) {
-  return rooms[room];
-}
-function getPeerRoom(ws) {
-  return ws.__room || "";
-}
-function getPeerRole(ws) {
-  return ws.__role || "";
-}
+function getPeerId(ws) { return ws.__id || ""; }
+function getPeerRoom(ws) { return ws.__room || ""; }
+function getPeerRole(ws) { return ws.__role || ""; }
+function getRoomInfo(room) { return rooms[room]; }
+function assignId() { return Math.random().toString(36).slice(2, 10); }
+
 function removeFromRooms(leaver) {
   for (const [room, info] of Object.entries(rooms)) {
     if (info.host === leaver) {
-      const next = info.clients.values().next().value;
-      if (next) {
-        info.clients.delete(next);
-        info.host = next;
-        next.__role = "host";
-        safeSend(next, { type: "role", room, role: "host" });
-        for (const c of info.clients) {
-          safeSend(c, { type: "host-changed", room });
+      const nextEntry = info.clients.entries().next();
+      if (!nextEntry.done) {
+        const [nextId, nextWs] = nextEntry.value;
+        info.clients.delete(nextId);
+        info.host = nextWs;
+        nextWs.__role = "host";
+        safeSend(nextWs, { type: "role", room, role: "host" });
+        for (const [cid, cws] of info.clients) {
+          safeSend(cws, { type: "host-changed", room });
         }
       } else {
-        for (const c of info.clients) {
-          safeSend(c, { type: "room-closed", room });
+        for (const [, cws] of info.clients) {
+          safeSend(cws, { type: "room-closed", room });
         }
         delete rooms[room];
       }
       continue;
     }
-    if (info.clients.has(leaver)) info.clients.delete(leaver);
+    const cid = getPeerId(leaver);
+    if (cid && info.clients.has(cid)) info.clients.delete(cid);
     if (!info.host && info.clients.size === 0) delete rooms[room];
   }
   leaver.__room = "";
   leaver.__role = "";
+  leaver.__id = "";
 }
 
 wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.on("pong", () => (ws.isAlive = true));
+  ws.__id = assignId();
 
   ws.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (!msg || typeof msg !== "object") return;
     const type = msg.type;
 
     if (type === "join" && typeof msg.room === "string") {
       const room = msg.room;
       if (!rooms[room]) {
-        rooms[room] = { host: ws, clients: new Set() };
+        rooms[room] = { host: ws, clients: new Map() };
         ws.__room = room;
         ws.__role = "host";
-        debugLog("[join] host created room", room);
-        safeSend(ws, { type: "role", room, role: "host" });
+        debugLog("[join] host created", room, "id=", ws.__id);
+        safeSend(ws, { type: "join-ok", room, role: "host", id: ws.__id });
         return;
       }
       const info = rooms[room];
@@ -78,20 +73,15 @@ wss.on("connection", (ws) => {
         info.host = ws;
         ws.__room = room;
         ws.__role = "host";
-        debugLog("[join] host assigned room", room);
-        safeSend(ws, { type: "role", room, role: "host" });
-      } else if (info.host === ws) {
-        ws.__room = room;
-        ws.__role = "host";
-        debugLog("[join] host rejoined room", room);
-        safeSend(ws, { type: "role", room, role: "host" });
+        debugLog("[join] host assigned", room, "id=", ws.__id);
+        safeSend(ws, { type: "join-ok", room, role: "host", id: ws.__id });
       } else {
-        info.clients.add(ws);
+        info.clients.set(ws.__id, ws);
         ws.__room = room;
         ws.__role = "client";
-        debugLog("[join] client joined room", room, "clients=", info.clients.size);
-        safeSend(ws, { type: "role", room, role: "client" });
-        safeSend(info.host, { type: "client-joined", room });
+        debugLog("[join] client joined", room, "id=", ws.__id, "count=", info.clients.size);
+        safeSend(ws, { type: "join-ok", room, role: "client", id: ws.__id });
+        safeSend(info.host, { type: "client-joined", room, id: ws.__id });
       }
       return;
     }
@@ -103,44 +93,52 @@ wss.on("connection", (ws) => {
       if (getPeerRole(ws) !== "client") return;
       const oldHost = info.host;
       info.host = ws;
-      info.clients.delete(ws);
+      const cid = getPeerId(ws);
+      if (cid) info.clients.delete(cid);
       if (oldHost) {
-        info.clients.add(oldHost);
         oldHost.__role = "client";
+        const oldId = getPeerId(oldHost) || assignId();
+        oldHost.__id = oldId;
+        info.clients.set(oldId, oldHost);
         safeSend(oldHost, { type: "role", room, role: "client" });
       }
       ws.__role = "host";
       safeSend(ws, { type: "role", room, role: "host" });
-      debugLog("[promote-host]", "room=", room);
+      debugLog("[promote-host]", room, "newHostId=", getPeerId(ws));
       return;
     }
 
-    if (type === "ping") {
-      safeSend(ws, { type: "pong" });
+    if (type === "ping") { safeSend(ws, { type: "pong" }); return; }
+
+    if (type === "app") {
+      const room = typeof msg.room === "string" ? msg.room : getPeerRoom(ws);
+      const info = getRoomInfo(room);
+      if (!info) return;
+      const role = getPeerRole(ws);
+      if (role === "client") {
+        if (info.host) safeSend(info.host, msg);
+      } else if (role === "host") {
+        for (const [, cws] of info.clients) safeSend(cws, msg);
+      }
       return;
     }
 
     const relayTypes = new Set(["offer", "answer", "ice"]);
     if (relayTypes.has(type)) {
-      const room = typeof msg.room === "string" && msg.room ? msg.room : getPeerRoom(ws);
-      const info = room ? getRoomInfo(room) : null;
+      const room = typeof msg.room === "string" ? msg.room : getPeerRoom(ws);
+      const info = getRoomInfo(room);
       if (!info) return;
-      const senderRole = getPeerRole(ws);
-      const targets = [];
-      if (senderRole === "host") {
-        for (const c of info.clients) targets.push(c);
-      } else if (senderRole === "client") {
-        if (info.host) targets.push(info.host);
-      } else {
-        if (info.host) targets.push(info.host);
-        for (const c of info.clients) targets.push(c);
-      }
-      if (DEBUG && targets.length > 0) {
-        debugLog("[relay]", type, "room=", room, "from=", senderRole, "to=", targets.length);
-      }
-      for (const t of targets) {
-        if (t !== ws && t.readyState === WebSocket.OPEN) t.send(JSON.stringify(msg));
-      }
+      const to = msg.to;
+      const from = msg.from;
+      if (typeof to !== "string" || !to) return;
+      if (typeof from !== "string" || !from) return;
+
+      let target = null;
+      if (to === "host") target = info.host;
+      else target = info.clients.get(to);
+
+      if (DEBUG) debugLog("[relay]", type, "room=", room, "from=", from, "to=", to, !!target);
+      if (target && target.readyState === WebSocket.OPEN) target.send(JSON.stringify(msg));
       return;
     }
   });
@@ -151,14 +149,9 @@ wss.on("connection", (ws) => {
 
 setInterval(() => {
   for (const client of wss.clients) {
-    if (!client.isAlive) {
-      client.terminate();
-      continue;
-    }
+    if (!client.isAlive) { client.terminate(); continue; }
     client.isAlive = false;
-    try {
-      client.ping();
-    } catch {}
+    try { client.ping(); } catch {}
   }
 }, INTERVAL_MS);
 
