@@ -103,8 +103,12 @@ wss.on("connection", (ws) => {
         safeSend(oldHost, { type: "role", room, role: "client" });
       }
       ws.__role = "host";
-      safeSend(ws, { type: "role", room, role: "host" });
-      debugLog("[promote-host]", room, "newHostId=", getPeerId(ws));
+      // Include existing client IDs so the new host can populate its UI peer list
+      // without needing a separate round-trip message.
+      const clientIds = [];
+      for (const [existingId] of info.clients) clientIds.push(existingId);
+      safeSend(ws, { type: "role", room, role: "host", clients: clientIds });
+      debugLog("[promote-host]", room, "newHostId=", getPeerId(ws), "clients=", clientIds);
       return;
     }
 
