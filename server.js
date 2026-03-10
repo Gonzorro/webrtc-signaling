@@ -86,6 +86,31 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (type === "request-promote-client") {
+      const room = typeof msg.room === "string" ? msg.room : getPeerRoom(ws);
+      const info = getRoomInfo(room);
+      if (!info) return;
+      if (getPeerRole(ws) !== "host") return;
+      const targetId = typeof msg.client_id === "string" ? msg.client_id : "";
+      if (!targetId) return;
+      const targetWs = info.clients.get(targetId);
+      if (!targetWs) return;
+      const oldHost = ws;
+      info.host = targetWs;
+      info.clients.delete(targetId);
+      oldHost.__role = "client";
+      const oldId = getPeerId(oldHost) || assignId();
+      oldHost.__id = oldId;
+      info.clients.set(oldId, oldHost);
+      safeSend(oldHost, { type: "role", room, role: "client" });
+      targetWs.__role = "host";
+      const clientIds = [];
+      for (const [existingId] of info.clients) clientIds.push(existingId);
+      safeSend(targetWs, { type: "role", room, role: "host", clients: clientIds });
+      debugLog("[request-promote-client]", room, "newHostId=", getPeerId(targetWs));
+      return;
+    }
+
     if (type === "promote-host") {
       const room = typeof msg.room === "string" ? msg.room : getPeerRoom(ws);
       const info = getRoomInfo(room);
