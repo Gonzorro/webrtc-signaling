@@ -26,9 +26,11 @@ function removeFromRooms(leaver) {
         info.clients.delete(nextId);
         info.host = nextWs;
         nextWs.__role = "host";
-        safeSend(nextWs, { type: "role", room, role: "host" });
+        const remainingClientIds = [];
+        for (const [existingId] of info.clients) remainingClientIds.push(existingId);
+        safeSend(nextWs, { type: "role", room, role: "host", clients: remainingClientIds });
         for (const [cid, cws] of info.clients) {
-          safeSend(cws, { type: "host-changed", room });
+          safeSend(cws, { type: "host-changed", room, new_host_id: getPeerId(nextWs) });
         }
       } else {
         for (const [, cws] of info.clients) {
