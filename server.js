@@ -17,33 +17,60 @@ function getPeerRole(ws) { return ws.__role || ""; }
 function getRoomInfo(room) { return rooms[room]; }
 function assignId() { return Math.random().toString(36).slice(2, 10); }
 
-function removeFromRooms(leaver) {
-  for (const [room, info] of Object.entries(rooms)) {
-    if (info.host === leaver) {
-      const nextEntry = info.clients.entries().next();
-      if (!nextEntry.done) {
-        const [nextId, nextWs] = nextEntry.value;
-        info.clients.delete(nextId);
-        info.host = nextWs;
-        nextWs.__role = "host";
-        const remainingClientIds = [];
-        for (const [existingId] of info.clients) remainingClientIds.push(existingId);
-        safeSend(nextWs, { type: "role", room, role: "host", clients: remainingClientIds });
-        for (const [cid, cws] of info.clients) {
-          safeSend(cws, { type: "host-changed", room, new_host_id: getPeerId(nextWs) });
-        }
-      } else {
-        for (const [, cws] of info.clients) {
-          safeSend(cws, { type: "room-closed", room });
-        }
-        delete rooms[room];
-      }
-      continue;
-    }
-    const cid = getPeerId(leaver);
-    if (cid && info.clients.has(cid)) info.clients.delete(cid);
-    if (!info.host && info.clients.size === 0) delete rooms[room];
+function broadcastToRoom(info, msg, exclude = null) {
+  if (info.host && info.host !== exclude) safeSend(info.host, msg);
+  for (const [, cws] of info.clients) {
+    if (cws !== exclude) safeSend(cws, msg);
   }
+}
+
+function closeRoomIfEmpty(room, info) {
+  if (!info.host && info.clients.size === 0) {
+    delete rooms[room];
+    debugLog("[room] closed (empty)", room);
+  }
+}
+
+function removeFromRooms(leaver) {
+  const room = getPeerRoom(leaver);
+  const leaverId = getPeerId(leaver);
+  if (!room || !rooms[room]) {
+    leaver.__room = "";
+    leaver.__role = "";
+    leaver.__id = "";
+    return;
+  }
+
+  const info = rooms[room];
+
+  if (info.host === leaver) {
+    const nextEntry = info.clients.entries().next();
+    if (!nextEntry.done) {
+      const [nextId, nextWs] = nextEntry.value;
+      info.clients.delete(nextId);
+      info.host = nextWs;
+      nextWs.__role = "host";
+      const remainingClientIds = [];
+      for (const [existingId] of info.clients) remainingClientIds.push(existingId);
+      safeSend(nextWs, { type: "role", room, role: "host", clients: remainingClientIds });
+      for (const [, cws] of info.clients) {
+        safeSend(cws, { type: "host-changed", room, new_host_id: getPeerId(nextWs) });
+      }
+      broadcastToRoom(info, { type: "peer-left", room, id: leaverId }, null);
+      debugLog("[leave] host left, promoted", getPeerId(nextWs), "in room", room);
+    } else {
+      delete rooms[room];
+      debugLog("[leave] host left, room closed (empty)", room);
+    }
+  } else {
+    if (leaverId && info.clients.has(leaverId)) {
+      info.clients.delete(leaverId);
+      broadcastToRoom(info, { type: "peer-left", room, id: leaverId });
+      debugLog("[leave] client left", leaverId, "room", room, "remaining=", info.clients.size);
+    }
+    closeRoomIfEmpty(room, info);
+  }
+
   leaver.__room = "";
   leaver.__role = "";
   leaver.__id = "";
@@ -136,6 +163,15 @@ wss.on("connection", (ws) => {
       for (const [existingId] of info.clients) clientIds.push(existingId);
       safeSend(ws, { type: "role", room, role: "host", clients: clientIds });
       debugLog("[promote-host]", room, "newHostId=", getPeerId(ws), "clients=", clientIds);
+      return;
+    }
+
+    if (type === "leave") {
+      const room = typeof msg.room === "string" ? msg.room : getPeerRoom(ws);
+      if (room === getPeerRoom(ws)) {
+        debugLog("[leave] explicit leave", getPeerId(ws), "room", room);
+        removeFromRooms(ws);
+      }
       return;
     }
 
