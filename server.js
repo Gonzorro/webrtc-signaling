@@ -1,11 +1,16 @@
+const http = require("http");
 const WebSocket = require("ws");
+const { createClient } = require("@supabase/supabase-js");
 
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
-
-const rooms = Object.create(null); // room -> { host: ws, clients: Map<id, ws> }
 const DEBUG = process.env.DEBUG_SIGNALING === "1";
 const INTERVAL_MS = 30000;
+
+const supabase = process.env.SUPABASE_URL
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+  : null;
+
+const rooms = Object.create(null);
 
 function debugLog(...args) { if (DEBUG) console.log(...args); }
 function safeSend(ws, obj) {
@@ -16,6 +21,12 @@ function getPeerRoom(ws) { return ws.__room || ""; }
 function getPeerRole(ws) { return ws.__role || ""; }
 function getRoomInfo(room) { return rooms[room]; }
 function assignId() { return Math.random().toString(36).slice(2, 10); }
+
+async function verifyToken(token) {
+  if (!token || !supabase) return null;
+  const { data, error } = await supabase.auth.getUser(token);
+  return (error || !data.user) ? null : data.user;
+}
 
 function broadcastToRoom(info, msg, exclude = null) {
   if (info.host && info.host !== exclude) safeSend(info.host, msg);
@@ -76,18 +87,44 @@ function removeFromRooms(leaver) {
   leaver.__id = "";
 }
 
+const server = http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/ice-servers") {
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({
+      iceServers: [
+        { urls: ["stun:stun.l.google.com:19302"] },
+        {
+          urls: (process.env.TURN_URLS || "").split(",").filter(Boolean),
+          username: process.env.TURN_USERNAME || "",
+          credential: process.env.TURN_CREDENTIAL || ""
+        }
+      ]
+    }));
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+
+const wss = new WebSocket.Server({ server });
+
 wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.on("pong", () => (ws.isAlive = true));
   ws.__id = assignId();
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (!msg || typeof msg !== "object") return;
     const type = msg.type;
 
     if (type === "join" && typeof msg.room === "string") {
+      if (supabase) {
+        const user = await verifyToken(msg.token);
+        if (!user) { safeSend(ws, { type: "error", reason: "unauthorized" }); return; }
+        ws.__user_id = user.id;
+      }
       const room = msg.room;
       if (!rooms[room]) {
         rooms[room] = { host: ws, clients: new Map() };
@@ -157,8 +194,6 @@ wss.on("connection", (ws) => {
         safeSend(oldHost, { type: "role", room, role: "client" });
       }
       ws.__role = "host";
-      // Include existing client IDs so the new host can populate its UI peer list
-      // without needing a separate round-trip message.
       const clientIds = [];
       for (const [existingId] of info.clients) clientIds.push(existingId);
       safeSend(ws, { type: "role", room, role: "host", clients: clientIds });
@@ -176,6 +211,15 @@ wss.on("connection", (ws) => {
     }
 
     if (type === "ping") { safeSend(ws, { type: "pong" }); return; }
+
+    if (type === "report-usage") {
+      const bytes = typeof msg.bytes === "number" && msg.bytes > 0 ? msg.bytes : 0;
+      if (ws.__user_id && bytes > 0 && supabase) {
+        await supabase.rpc("deduct_bytes", { uid: ws.__user_id, amount: bytes });
+        debugLog("[usage] deducted", bytes, "bytes for", ws.__user_id);
+      }
+      return;
+    }
 
     if (type === "app") {
       const room = typeof msg.room === "string" ? msg.room : getPeerRoom(ws);
@@ -222,4 +266,4 @@ setInterval(() => {
   }
 }, INTERVAL_MS);
 
-console.log(`Signaling server running on port ${PORT}`);
+server.listen(PORT, () => console.log(`Signaling server running on port ${PORT}`));

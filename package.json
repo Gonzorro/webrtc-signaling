@@ -8,6 +8,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "ws": "^8.16.0"
+    "ws": "^8.16.0",
+    "@supabase/supabase-js": "^2.45.0"
   }
 }
