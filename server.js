@@ -241,7 +241,7 @@ wss.on("connection", (ws) => {
     if (type === "report-usage") {
       const bytes = typeof msg.bytes === "number" && msg.bytes > 0 ? msg.bytes : 0;
       if (ws.__user_id && bytes > 0 && supabase) {
-        await supabase.rpc("deduct_bytes", { uid: ws.__user_id, amount: bytes });
+        await supabase.rpc("deduct_bytes", { p_user_id: ws.__user_id, p_bytes: bytes });
         debugLog("[usage] deducted", bytes, "bytes for", ws.__user_id);
       }
       return;
