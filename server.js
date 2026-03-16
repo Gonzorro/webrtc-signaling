@@ -137,13 +137,19 @@ wss.on("connection", (ws) => {
         ws.__user_id = user.id;
       }
       const room = msg.room;
-      const willBeHost = !rooms[room] || !rooms[room].host;
-      if (willBeHost) {
+      const createMode = msg.create !== false;
+      if (createMode) {
+        if (rooms[room] && rooms[room].host) { safeSend(ws, { type: "error", reason: "room_exists" }); return; }
         const hasCredits = await checkBalance(ws.__user_id);
         if (!hasCredits) { safeSend(ws, { type: "error", reason: "insufficient_credits" }); return; }
+      } else {
+        if (!rooms[room] || !rooms[room].host) { safeSend(ws, { type: "error", reason: "room_not_found" }); return; }
+        const roomPwd = rooms[room].password || "";
+        const msgPwd = msg.password || "";
+        if (roomPwd !== msgPwd) { safeSend(ws, { type: "error", reason: "wrong_password" }); return; }
       }
       if (!rooms[room]) {
-        rooms[room] = { host: ws, clients: new Map() };
+        rooms[room] = { host: ws, clients: new Map(), password: msg.password || "" };
         ws.__room = room;
         ws.__role = "host";
         debugLog("[join] host created", room, "id=", ws.__id);
