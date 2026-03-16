@@ -28,6 +28,17 @@ async function verifyToken(token) {
   return (error || !data.user) ? null : data.user;
 }
 
+async function checkBalance(userId) {
+  if (!supabase || !userId) return true;
+  const { data, error } = await supabase
+    .from("user_balance")
+    .select("bytes_remaining")
+    .eq("user_id", userId)
+    .single();
+  if (error || !data) return true;
+  return data.bytes_remaining > 0;
+}
+
 function broadcastToRoom(info, msg, exclude = null) {
   if (info.host && info.host !== exclude) safeSend(info.host, msg);
   for (const [, cws] of info.clients) {
@@ -126,6 +137,11 @@ wss.on("connection", (ws) => {
         ws.__user_id = user.id;
       }
       const room = msg.room;
+      const willBeHost = !rooms[room] || !rooms[room].host;
+      if (willBeHost) {
+        const hasCredits = await checkBalance(ws.__user_id);
+        if (!hasCredits) { safeSend(ws, { type: "error", reason: "insufficient_credits" }); return; }
+      }
       if (!rooms[room]) {
         rooms[room] = { host: ws, clients: new Map() };
         ws.__room = room;
@@ -161,6 +177,8 @@ wss.on("connection", (ws) => {
       if (!targetId) return;
       const targetWs = info.clients.get(targetId);
       if (!targetWs) return;
+      const hasCredits = await checkBalance(targetWs.__user_id);
+      if (!hasCredits) { safeSend(ws, { type: "promote-error", reason: "insufficient_credits", client_id: targetId }); return; }
       const oldHost = ws;
       info.host = targetWs;
       info.clients.delete(targetId);
@@ -182,6 +200,8 @@ wss.on("connection", (ws) => {
       const info = getRoomInfo(room);
       if (!info) return;
       if (getPeerRole(ws) !== "client") return;
+      const hasCredits = await checkBalance(ws.__user_id);
+      if (!hasCredits) { safeSend(ws, { type: "promote-error", reason: "insufficient_credits", client_id: getPeerId(ws) }); return; }
       const oldHost = info.host;
       info.host = ws;
       const cid = getPeerId(ws);
