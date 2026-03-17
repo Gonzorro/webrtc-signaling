@@ -16,6 +16,9 @@ function debugLog(...args) { if (DEBUG) console.log(...args); }
 function safeSend(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
+function safeSendBinary(ws, data) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(data, { binary: true });
+}
 function getPeerId(ws) { return ws.__id || ""; }
 function getPeerRoom(ws) { return ws.__room || ""; }
 function getPeerRole(ws) { return ws.__role || ""; }
@@ -124,7 +127,37 @@ wss.on("connection", (ws) => {
   ws.on("pong", () => (ws.isAlive = true));
   ws.__id = assignId();
 
-  ws.on("message", async (raw) => {
+  ws.on("message", async (raw, isBinary) => {
+    if (isBinary) {
+      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      if (buf.length < 4) return;
+      const room = ws.__room;
+      if (!room || !rooms[room]) return;
+      const info = rooms[room];
+      const senderId = ws.__id || "";
+      const targetIdLen = buf.readUInt16BE(0);
+      if (buf.length < 3 + targetIdLen) return;
+      const targetId = buf.toString("utf8", 2, 2 + targetIdLen);
+      const flags = buf[2 + targetIdLen];
+      const payload = buf.subarray(3 + targetIdLen);
+      const senderIdBuf = Buffer.from(senderId, "utf8");
+      const header = Buffer.alloc(2 + senderIdBuf.length);
+      header.writeUInt16BE(senderIdBuf.length, 0);
+      senderIdBuf.copy(header, 2);
+      const forwarded = Buffer.concat([header, payload]);
+      if (flags === 0x01) {
+        if (info.host && info.host !== ws) safeSendBinary(info.host, forwarded);
+        for (const [, cws] of info.clients) {
+          if (cws !== ws) safeSendBinary(cws, forwarded);
+        }
+      } else {
+        let target = null;
+        if (targetId === "host") target = info.host;
+        else target = info.clients.get(targetId);
+        if (target) safeSendBinary(target, forwarded);
+      }
+      return;
+    }
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (!msg || typeof msg !== "object") return;
