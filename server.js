@@ -260,7 +260,13 @@ wss.on("connection", (ws) => {
       if (role === "client") {
         if (info.host) safeSend(info.host, msg);
       } else if (role === "host") {
-        for (const [, cws] of info.clients) safeSend(cws, msg);
+        const to = typeof msg.to === "string" ? msg.to : null;
+        if (to) {
+          const target = info.clients.get(to);
+          if (target) safeSend(target, msg);
+        } else {
+          for (const [, cws] of info.clients) safeSend(cws, msg);
+        }
       }
       return;
     }
