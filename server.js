@@ -108,11 +108,6 @@ const server = http.createServer((req, res) => {
           urls: (process.env.TURN_URLS || "").split(",").filter(Boolean),
           username: process.env.TURN_USERNAME || "",
           credential: process.env.TURN_CREDENTIAL || ""
-        },
-        {
-          urls: (process.env.TURN2_URLS || "").split(",").filter(Boolean),
-          username: process.env.TURN2_USERNAME || "",
-          credential: process.env.TURN2_CREDENTIAL || ""
         }
       ].filter(e => e.urls && e.urls.length > 0)
     }));
