@@ -1,16 +1,60 @@
 const http = require("http");
+const fs = require("fs");
+const nodePath = require("path");
 const WebSocket = require("ws");
 const { createClient } = require("@supabase/supabase-js");
+
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 8080;
 const DEBUG = process.env.DEBUG_SIGNALING === "1";
 const INTERVAL_MS = 30000;
+
+const LEMON_API_KEY = process.env.LEMON_API_KEY || "";
+const LEMON_WEBHOOK_SECRET = process.env.LEMON_WEBHOOK_SECRET || "";
+const LEMON_STORE_ID = process.env.LEMON_STORE_ID || "";
+
+const CREDIT_PACKS = {
+  "1gb":  { bytes: 1073741824,   name: "1 GB",  variant_id: process.env.LEMON_VARIANT_1GB  || "" },
+  "5gb":  { bytes: 5368709120,   name: "5 GB",  variant_id: process.env.LEMON_VARIANT_5GB  || "" },
+  "20gb": { bytes: 21474836480,  name: "20 GB", variant_id: process.env.LEMON_VARIANT_20GB || "" },
+  "50gb": { bytes: 53687091200,  name: "50 GB", variant_id: process.env.LEMON_VARIANT_50GB || "" },
+};
 
 const supabase = process.env.SUPABASE_URL
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
   : null;
 
 const rooms = Object.create(null);
+
+const turnUsername = process.env.TURN_USERNAME || "";
+const turnCredential = process.env.TURN_CREDENTIAL || "";
+const turnGroups = [];
+const ipMap = Object.create(null);
+for (const url of (process.env.TURN_URLS || "").split(",").filter(Boolean)) {
+  const m = url.match(/turn:([^:?]+)/);
+  if (!m) continue;
+  const ip = m[1];
+  if (!ipMap[ip]) { ipMap[ip] = { ip, urls: [], load: 0 }; turnGroups.push(ipMap[ip]); }
+  ipMap[ip].urls.push(url);
+}
+
+function getLeastLoadedTurn() {
+  if (turnGroups.length === 0) return null;
+  let best = turnGroups[0];
+  for (const g of turnGroups) { if (g.load < best.load) best = g; }
+  best.load++;
+  debugLog("[turn] assigned", best.ip, "load now", best.load, turnGroups.map(g => g.ip + "=" + g.load).join(" "));
+  return best;
+}
+
+function releaseTurn(ws) {
+  if (ws.__turn_ip && ipMap[ws.__turn_ip]) {
+    ipMap[ws.__turn_ip].load = Math.max(0, ipMap[ws.__turn_ip].load - 1);
+    debugLog("[turn] released", ws.__turn_ip, "load now", ipMap[ws.__turn_ip].load);
+    ws.__turn_ip = "";
+  }
+}
 
 function debugLog(...args) { if (DEBUG) console.log(...args); }
 function safeSend(ws, obj) {
@@ -103,17 +147,263 @@ function removeFromRooms(leaver) {
 
 const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/ice-servers") {
+    const iceServers = [{ urls: ["stun:stun.l.google.com:19302"] }];
+    const turn = getLeastLoadedTurn();
+    if (turn) {
+      iceServers.push({ urls: turn.urls, username: turnUsername, credential: turnCredential, _ip: turn.ip });
+    }
     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-    res.end(JSON.stringify({
-      iceServers: [
-        { urls: ["stun:stun.l.google.com:19302"] },
-        {
-          urls: (process.env.TURN_URLS || "").split(",").filter(Boolean),
-          username: process.env.TURN_USERNAME || "",
-          credential: process.env.TURN_CREDENTIAL || ""
+    res.end(JSON.stringify({ iceServers }));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/turn-status") {
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({ servers: turnGroups.map(g => ({ ip: g.ip, load: g.load, urls: g.urls })) }));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/version") {
+    fs.readFile("/opt/updates/version.json", (err, data) => {
+      if (err) {
+        res.writeHead(404, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "version file not found" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(data);
+    });
+    return;
+  }
+  if (req.method === "GET" && req.url === "/versions") {
+    const archiveDir = "/opt/updates/archive";
+    fs.readdir(archiveDir, (err, entries) => {
+      if (err) { res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }); res.end("[]"); return; }
+      const versions = entries.filter(e => { try { return fs.statSync(nodePath.join(archiveDir, e)).isDirectory(); } catch { return false; } }).sort();
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(versions));
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url.startsWith("/rollback/")) {
+    const ver = req.url.slice("/rollback/".length);
+    if (!ver || ver.includes("..") || ver.includes("/")) { res.writeHead(400); res.end("bad version"); return; }
+    const archiveDir = nodePath.join("/opt/updates/archive", ver);
+    if (!fs.existsSync(archiveDir)) { res.writeHead(404); res.end("version not found"); return; }
+    const { execSync } = require("child_process");
+    try {
+      execSync(`cp -f "${archiveDir}/version.json" /opt/updates/version.json`);
+      execSync(`cp -rf "${archiveDir}/patch/"* /opt/updates/patch/ 2>/dev/null || true`);
+      execSync(`cp -rf "${archiveDir}/full/windows/"* /opt/updates/full/windows/ 2>/dev/null || true`);
+      execSync(`cp -rf "${archiveDir}/full/macos/"* /opt/updates/full/macos/ 2>/dev/null || true`);
+      execSync(`cp -rf "${archiveDir}/full/android/"* /opt/updates/full/android/ 2>/dev/null || true`);
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ ok: true, version: ver }));
+    } catch (e) {
+      res.writeHead(500); res.end(e.message);
+    }
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/updates/")) {
+    const filePath = nodePath.join("/opt", req.url);
+    const resolved = nodePath.resolve(filePath);
+    if (!resolved.startsWith("/opt/updates/")) {
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+    fs.stat(resolved, (err, stats) => {
+      if (err || !stats.isFile()) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": stats.size,
+        "Access-Control-Allow-Origin": "*"
+      });
+      fs.createReadStream(resolved).pipe(res);
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/logs") {
+    let body = "";
+    req.on("data", chunk => { body += chunk; if (body.length > 512000) { req.destroy(); } });
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        const userId = (data.user_id || "anonymous").replace(/[^a-zA-Z0-9_-]/g, "_");
+        const logsDir = `/opt/logs/${userId}`;
+        fs.mkdirSync(logsDir, { recursive: true });
+        const ts = (data.timestamp || new Date().toISOString()).replace(/[: ]/g, "-");
+        const filename = `${ts}.json`;
+        fs.writeFileSync(nodePath.join(logsDir, filename), body);
+        const files = fs.readdirSync(logsDir).sort();
+        while (files.length > 20) { fs.unlinkSync(nodePath.join(logsDir, files.shift())); }
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400, { "Access-Control-Allow-Origin": "*" }); res.end(e.message);
+      }
+    });
+    return;
+  }
+  if (req.method === "GET" && req.url === "/logs") {
+    const logsBase = "/opt/logs";
+    fs.readdir(logsBase, (err, users) => {
+      if (err) { res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }); res.end("{}"); return; }
+      const result = {};
+      for (const u of users) {
+        try {
+          const uDir = nodePath.join(logsBase, u);
+          if (!fs.statSync(uDir).isDirectory()) continue;
+          const files = fs.readdirSync(uDir).sort().reverse();
+          result[u] = files.slice(0, 5);
+        } catch {}
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify(result));
+    });
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/logs/")) {
+    const parts = req.url.slice(6).split("/");
+    const userId = (parts[0] || "").replace(/[^a-zA-Z0-9_-]/g, "_");
+    const fileName = parts[1] || "";
+    if (!userId) { res.writeHead(400); res.end("missing user_id"); return; }
+    const userDir = nodePath.join("/opt/logs", userId);
+    if (fileName) {
+      const safe = fileName.replace(/[^a-zA-Z0-9_.\-]/g, "_");
+      const filePath = nodePath.join(userDir, safe);
+      if (!filePath.startsWith(userDir)) { res.writeHead(403); res.end(); return; }
+      fs.readFile(filePath, (err, data) => {
+        if (err) { res.writeHead(404); res.end("not found"); return; }
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(data);
+      });
+    } else {
+      fs.readdir(userDir, (err, files) => {
+        if (err) { res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }); res.end("[]"); return; }
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify(files.sort().reverse()));
+      });
+    }
+    return;
+  }
+  if (req.method === "POST" && req.url === "/create-checkout") {
+    let body = "";
+    req.on("data", c => { body += c; if (body.length > 8192) req.destroy(); });
+    req.on("end", async () => {
+      try {
+        const data = JSON.parse(body);
+        const packKey = data.pack || "";
+        const userId = data.user_id || "";
+        const pack = CREDIT_PACKS[packKey];
+        if (!pack || !pack.variant_id || !userId) {
+          res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+          res.end(JSON.stringify({ error: "invalid pack or user_id" }));
+          return;
         }
-      ].filter(e => e.urls && e.urls.length > 0)
-    }));
+        const resp = await fetch("https://api.lemonsqueezy.com/v1/checkouts", {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${LEMON_API_KEY}`, "Content-Type": "application/vnd.api+json", "Accept": "application/vnd.api+json" },
+          body: JSON.stringify({
+            data: {
+              type: "checkouts",
+              attributes: { checkout_data: { custom: { user_id: userId, pack: packKey } } },
+              relationships: {
+                store: { data: { type: "stores", id: LEMON_STORE_ID } },
+                variant: { data: { type: "variants", id: pack.variant_id } }
+              }
+            }
+          })
+        });
+        const result = await resp.json();
+        const url = result?.data?.attributes?.url || "";
+        if (!url) {
+          console.log("[lemon] checkout creation failed:", JSON.stringify(result));
+          res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+          res.end(JSON.stringify({ error: "checkout creation failed" }));
+          return;
+        }
+        console.log("[lemon] checkout created for", userId, packKey, url);
+        res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ url }));
+      } catch (e) {
+        console.log("[lemon] create-checkout error:", e.message);
+        res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/lemon-webhook") {
+    let raw = "";
+    req.on("data", c => { raw += c; if (raw.length > 65536) req.destroy(); });
+    req.on("end", async () => {
+      try {
+        const sig = req.headers["x-signature"] || "";
+        if (LEMON_WEBHOOK_SECRET) {
+          const expected = crypto.createHmac("sha256", LEMON_WEBHOOK_SECRET).update(raw).digest("hex");
+          if (sig !== expected) {
+            console.log("[lemon] webhook signature mismatch");
+            res.writeHead(403); res.end("bad signature");
+            return;
+          }
+        }
+        const payload = JSON.parse(raw);
+        const eventName = payload?.meta?.event_name || "";
+        if (eventName !== "order_created") {
+          res.writeHead(200); res.end("ignored");
+          return;
+        }
+        const custom = payload?.meta?.custom_data || {};
+        const userId = custom.user_id || "";
+        const packKey = custom.pack || "";
+        const pack = CREDIT_PACKS[packKey];
+        if (!userId || !pack) {
+          console.log("[lemon] webhook missing user_id or pack:", userId, packKey);
+          res.writeHead(200); res.end("ok");
+          return;
+        }
+        if (supabase) {
+          await supabase.rpc("add_bytes", { p_user_id: userId, p_bytes: pack.bytes });
+          console.log("[lemon] credited", pack.name, "to", userId);
+        }
+        res.writeHead(200); res.end("ok");
+      } catch (e) {
+        console.log("[lemon] webhook error:", e.message);
+        res.writeHead(500); res.end(e.message);
+      }
+    });
+    return;
+  }
+  const WEBAPP_DIR = "/opt/webapp";
+  if (req.method === "GET" && (req.url === "/app" || req.url === "/app/")) {
+    const filePath = nodePath.join(WEBAPP_DIR, "index.html");
+    fs.readFile(filePath, (err, data) => {
+      if (err) { res.writeHead(404); res.end("not found"); return; }
+      res.writeHead(200, { "Content-Type": "text/html", "Access-Control-Allow-Origin": "*" });
+      res.end(data);
+    });
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/app/")) {
+    const relPath = req.url.slice(5);
+    if (relPath.includes("..")) { res.writeHead(403); res.end(); return; }
+    const filePath = nodePath.resolve(nodePath.join(WEBAPP_DIR, relPath));
+    if (!filePath.startsWith(WEBAPP_DIR)) { res.writeHead(403); res.end(); return; }
+    fs.stat(filePath, (err, stats) => {
+      if (err || !stats.isFile()) { res.writeHead(404); res.end(); return; }
+      const ext = nodePath.extname(filePath).toLowerCase();
+      const mimeTypes = {
+        ".html": "text/html", ".css": "text/css", ".js": "application/javascript",
+        ".json": "application/json", ".png": "image/png", ".svg": "image/svg+xml",
+        ".ico": "image/x-icon", ".woff2": "font/woff2"
+      };
+      const contentType = mimeTypes[ext] || "application/octet-stream";
+      res.writeHead(200, { "Content-Type": contentType, "Access-Control-Allow-Origin": "*" });
+      fs.createReadStream(filePath).pipe(res);
+    });
     return;
   }
   res.writeHead(404);
@@ -168,6 +458,11 @@ wss.on("connection", (ws) => {
         const user = await verifyToken(msg.token);
         if (!user) { safeSend(ws, { type: "error", reason: "unauthorized" }); return; }
         ws.__user_id = user.id;
+      }
+      if (!ws.__turn_ip && turnGroups.length > 0) {
+        let best = turnGroups[0];
+        for (const g of turnGroups) { if (g.load < best.load) best = g; }
+        ws.__turn_ip = best.ip;
       }
       const room = msg.room;
       const createMode = msg.create !== false;
@@ -319,8 +614,8 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => removeFromRooms(ws));
-  ws.on("error", () => removeFromRooms(ws));
+  ws.on("close", () => { releaseTurn(ws); removeFromRooms(ws); });
+  ws.on("error", () => { releaseTurn(ws); removeFromRooms(ws); });
 });
 
 setInterval(() => {
