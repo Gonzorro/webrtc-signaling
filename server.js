@@ -382,13 +382,13 @@ const server = http.createServer((req, res) => {
     const filePath = nodePath.join(WEBAPP_DIR, "index.html");
     fs.readFile(filePath, (err, data) => {
       if (err) { res.writeHead(404); res.end("not found"); return; }
-      res.writeHead(200, { "Content-Type": "text/html", "Access-Control-Allow-Origin": "*" });
+      res.writeHead(200, { "Content-Type": "text/html", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache, no-store, must-revalidate" });
       res.end(data);
     });
     return;
   }
   if (req.method === "GET" && req.url.startsWith("/app/")) {
-    const relPath = req.url.slice(5);
+    const relPath = req.url.slice(5).split("?")[0];
     if (relPath.includes("..")) { res.writeHead(403); res.end(); return; }
     const filePath = nodePath.resolve(nodePath.join(WEBAPP_DIR, relPath));
     if (!filePath.startsWith(WEBAPP_DIR)) { res.writeHead(403); res.end(); return; }
