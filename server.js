@@ -507,12 +507,16 @@ wss.on("connection", (ws) => {
         debugLog("[join] host assigned", room, "id=", ws.__id);
         safeSend(ws, { type: "join-ok", room, role: "host", id: ws.__id });
       } else {
+        const peers = [{ id: getPeerId(info.host), display_name: info.host.__display_name || "", role: "host" }];
+        for (const [cid, cws] of info.clients) {
+          peers.push({ id: cid, display_name: cws.__display_name || "", role: "client" });
+        }
         info.clients.set(ws.__id, ws);
         ws.__room = room;
         ws.__role = "client";
         debugLog("[join] client joined", room, "id=", ws.__id, "count=", info.clients.size);
-        safeSend(ws, { type: "join-ok", room, role: "client", id: ws.__id, host_name: info.host.__display_name || "", host_id: getPeerId(info.host) });
-        safeSend(info.host, { type: "client-joined", room, id: ws.__id, display_name: ws.__display_name || "" });
+        safeSend(ws, { type: "join-ok", room, role: "client", id: ws.__id, host_name: info.host.__display_name || "", host_id: getPeerId(info.host), peers });
+        broadcastToRoom(info, { type: "client-joined", room, id: ws.__id, display_name: ws.__display_name || "" }, ws);
       }
       return;
     }
