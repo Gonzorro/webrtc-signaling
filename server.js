@@ -106,7 +106,6 @@ function removeFromRooms(leaver) {
   if (!room || !rooms[room]) {
     leaver.__room = "";
     leaver.__role = "";
-    leaver.__id = "";
     return;
   }
 
@@ -123,7 +122,7 @@ function removeFromRooms(leaver) {
       for (const [existingId] of info.clients) remainingClientIds.push(existingId);
       safeSend(nextWs, { type: "role", room, role: "host", clients: remainingClientIds });
       for (const [, cws] of info.clients) {
-        safeSend(cws, { type: "host-changed", room, new_host_id: getPeerId(nextWs) });
+        safeSend(cws, { type: "host-changed", room, new_host_id: getPeerId(nextWs), display_name: nextWs.__display_name || "" });
       }
       broadcastToRoom(info, { type: "peer-left", room, id: leaverId }, null);
       debugLog("[leave] host left, promoted", getPeerId(nextWs), "in room", room);
@@ -142,7 +141,6 @@ function removeFromRooms(leaver) {
 
   leaver.__room = "";
   leaver.__role = "";
-  leaver.__id = "";
 }
 
 const server = http.createServer((req, res) => {
@@ -154,6 +152,22 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
     res.end(JSON.stringify({ iceServers }));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/status") {
+    var roomList = [];
+    var totalPlayers = 0;
+    for (var r in rooms) {
+      var info = rooms[r];
+      var clientCount = info.clients ? info.clients.size : 0;
+      var hostName = info.host ? (info.host.__display_name || "unknown") : "none";
+      roomList.push({ room: r, host: hostName, clients: clientCount });
+      totalPlayers += 1 + clientCount;
+    }
+    var wsCount = 0;
+    wss.clients.forEach(function() { wsCount++; });
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({ connections: wsCount, players: totalPlayers, rooms: roomList }));
     return;
   }
   if (req.method === "GET" && req.url === "/turn-status") {
@@ -459,6 +473,7 @@ wss.on("connection", (ws) => {
         if (!user) { safeSend(ws, { type: "error", reason: "unauthorized" }); return; }
         ws.__user_id = user.id;
       }
+      ws.__display_name = typeof msg.display_name === "string" ? msg.display_name : "";
       if (!ws.__turn_ip && turnGroups.length > 0) {
         let best = turnGroups[0];
         for (const g of turnGroups) { if (g.load < best.load) best = g; }
@@ -468,13 +483,13 @@ wss.on("connection", (ws) => {
       const createMode = msg.create !== false;
       if (createMode) {
         if (rooms[room] && rooms[room].host) { safeSend(ws, { type: "error", reason: "room_exists" }); return; }
-        const hasCredits = await checkBalance(ws.__user_id);
-        if (!hasCredits) { safeSend(ws, { type: "error", reason: "insufficient_credits" }); return; }
       } else {
         if (!rooms[room] || !rooms[room].host) { safeSend(ws, { type: "error", reason: "room_not_found" }); return; }
         const roomPwd = rooms[room].password || "";
         const msgPwd = msg.password || "";
         if (roomPwd !== msgPwd) { safeSend(ws, { type: "error", reason: "wrong_password" }); return; }
+        const totalInRoom = 1 + rooms[room].clients.size;
+        if (totalInRoom >= 4) { safeSend(ws, { type: "error", reason: "room_full" }); return; }
       }
       if (!rooms[room]) {
         rooms[room] = { host: ws, clients: new Map(), password: msg.password || "" };
@@ -496,8 +511,17 @@ wss.on("connection", (ws) => {
         ws.__room = room;
         ws.__role = "client";
         debugLog("[join] client joined", room, "id=", ws.__id, "count=", info.clients.size);
-        safeSend(ws, { type: "join-ok", room, role: "client", id: ws.__id });
-        safeSend(info.host, { type: "client-joined", room, id: ws.__id });
+        safeSend(ws, { type: "join-ok", room, role: "client", id: ws.__id, host_name: info.host.__display_name || "", host_id: getPeerId(info.host) });
+        safeSend(info.host, { type: "client-joined", room, id: ws.__id, display_name: ws.__display_name || "" });
+      }
+      return;
+    }
+
+    if (type === "display-name") {
+      const name = typeof msg.display_name === "string" ? msg.display_name : "";
+      if (name) {
+        ws.__display_name = name;
+        debugLog("[display-name] updated", getPeerId(ws), "name=", name);
       }
       return;
     }
@@ -511,8 +535,6 @@ wss.on("connection", (ws) => {
       if (!targetId) return;
       const targetWs = info.clients.get(targetId);
       if (!targetWs) return;
-      const hasCredits = await checkBalance(targetWs.__user_id);
-      if (!hasCredits) { safeSend(ws, { type: "promote-error", reason: "insufficient_credits", client_id: targetId }); return; }
       const oldHost = ws;
       info.host = targetWs;
       info.clients.delete(targetId);
@@ -534,8 +556,6 @@ wss.on("connection", (ws) => {
       const info = getRoomInfo(room);
       if (!info) return;
       if (getPeerRole(ws) !== "client") return;
-      const hasCredits = await checkBalance(ws.__user_id);
-      if (!hasCredits) { safeSend(ws, { type: "promote-error", reason: "insufficient_credits", client_id: getPeerId(ws) }); return; }
       const oldHost = info.host;
       info.host = ws;
       const cid = getPeerId(ws);
