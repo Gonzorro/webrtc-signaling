@@ -456,7 +456,7 @@ wss.on("connection", (ws) => {
         }
       } else {
         let target = null;
-        if (targetId === "host") target = info.host;
+        if (targetId === "host" || targetId === getPeerId(info.host)) target = info.host;
         else target = info.clients.get(targetId);
         if (target) safeSendBinary(target, forwarded);
       }
@@ -629,7 +629,7 @@ wss.on("connection", (ws) => {
       if (typeof from !== "string" || !from) return;
 
       let target = null;
-      if (to === "host") target = info.host;
+      if (to === "host" || to === getPeerId(info.host)) target = info.host;
       else target = info.clients.get(to);
 
       if (DEBUG) debugLog("[relay]", type, "room=", room, "from=", from, "to=", to, !!target);
