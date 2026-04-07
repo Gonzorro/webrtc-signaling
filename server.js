@@ -26,6 +26,7 @@ const supabase = process.env.SUPABASE_URL
   : null;
 
 const rooms = Object.create(null);
+const activeUsers = new Map();
 
 const turnUsername = process.env.TURN_USERNAME || "";
 const turnCredential = process.env.TURN_CREDENTIAL || "";
@@ -468,10 +469,23 @@ wss.on("connection", (ws) => {
     const type = msg.type;
 
     if (type === "join" && typeof msg.room === "string") {
-      if (supabase) {
-        const user = await verifyToken(msg.token);
+      const token = msg.token || "";
+      if (supabase && token) {
+        const user = await verifyToken(token);
         if (!user) { safeSend(ws, { type: "error", reason: "unauthorized" }); return; }
         ws.__user_id = user.id;
+        ws.__guest = false;
+        const prev = activeUsers.get(user.id);
+        if (prev && prev !== ws && prev.readyState === WebSocket.OPEN) {
+          debugLog("[session] replacing previous connection for", user.id);
+          safeSend(prev, { type: "error", reason: "session_replaced" });
+          prev.close();
+        }
+        activeUsers.set(user.id, ws);
+      } else if (supabase && !token) {
+        ws.__guest = true;
+        ws.__user_id = "";
+        debugLog("[join] guest connection from", ws.__display_name || "anonymous");
       }
       ws.__display_name = typeof msg.display_name === "string" ? msg.display_name : "";
       if (!ws.__turn_ip && turnGroups.length > 0) {
@@ -482,6 +496,7 @@ wss.on("connection", (ws) => {
       const room = msg.room;
       const createMode = msg.create !== false;
       if (createMode) {
+        if (ws.__guest) { safeSend(ws, { type: "error", reason: "guests_cannot_create" }); return; }
         if (rooms[room] && rooms[room].host) { safeSend(ws, { type: "error", reason: "room_exists" }); return; }
       } else {
         if (!rooms[room] || !rooms[room].host) { safeSend(ws, { type: "error", reason: "room_not_found" }); return; }
@@ -496,7 +511,7 @@ wss.on("connection", (ws) => {
         ws.__room = room;
         ws.__role = "host";
         debugLog("[join] host created", room, "id=", ws.__id);
-        safeSend(ws, { type: "join-ok", room, role: "host", id: ws.__id });
+        safeSend(ws, { type: "join-ok", room, role: "host", id: ws.__id, guest: !!ws.__guest });
         return;
       }
       const info = rooms[room];
@@ -505,18 +520,18 @@ wss.on("connection", (ws) => {
         ws.__room = room;
         ws.__role = "host";
         debugLog("[join] host assigned", room, "id=", ws.__id);
-        safeSend(ws, { type: "join-ok", room, role: "host", id: ws.__id });
+        safeSend(ws, { type: "join-ok", room, role: "host", id: ws.__id, guest: !!ws.__guest });
       } else {
-        const peers = [{ id: getPeerId(info.host), display_name: info.host.__display_name || "", role: "host" }];
+        const peers = [{ id: getPeerId(info.host), display_name: info.host.__display_name || "", role: "host", guest: !!info.host.__guest }];
         for (const [cid, cws] of info.clients) {
-          peers.push({ id: cid, display_name: cws.__display_name || "", role: "client" });
+          peers.push({ id: cid, display_name: cws.__display_name || "", role: "client", guest: !!cws.__guest });
         }
         info.clients.set(ws.__id, ws);
         ws.__room = room;
         ws.__role = "client";
         debugLog("[join] client joined", room, "id=", ws.__id, "count=", info.clients.size);
-        safeSend(ws, { type: "join-ok", room, role: "client", id: ws.__id, host_name: info.host.__display_name || "", host_id: getPeerId(info.host), peers });
-        broadcastToRoom(info, { type: "client-joined", room, id: ws.__id, display_name: ws.__display_name || "" }, ws);
+        safeSend(ws, { type: "join-ok", room, role: "client", id: ws.__id, host_name: info.host.__display_name || "", host_id: getPeerId(info.host), peers, guest: !!ws.__guest });
+        broadcastToRoom(info, { type: "client-joined", room, id: ws.__id, display_name: ws.__display_name || "", guest: !!ws.__guest }, ws);
       }
       return;
     }
@@ -539,6 +554,10 @@ wss.on("connection", (ws) => {
       if (!targetId) return;
       const targetWs = info.clients.get(targetId);
       if (!targetWs) return;
+      if (targetWs.__guest) {
+        safeSend(ws, { type: "promote-error", client_id: targetId, reason: "guest_cannot_be_host" });
+        return;
+      }
       const oldHost = ws;
       info.host = targetWs;
       info.clients.delete(targetId);
@@ -560,6 +579,10 @@ wss.on("connection", (ws) => {
       const info = getRoomInfo(room);
       if (!info) return;
       if (getPeerRole(ws) !== "client") return;
+      if (ws.__guest) {
+        safeSend(ws, { type: "error", reason: "guest_cannot_be_host" });
+        return;
+      }
       const oldHost = info.host;
       info.host = ws;
       const cid = getPeerId(ws);
@@ -638,8 +661,21 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => { releaseTurn(ws); removeFromRooms(ws); });
-  ws.on("error", () => { releaseTurn(ws); removeFromRooms(ws); });
+  ws.on("close", () => {
+    releaseTurn(ws);
+    removeFromRooms(ws);
+    if (ws.__user_id && activeUsers.get(ws.__user_id) === ws) {
+      activeUsers.delete(ws.__user_id);
+      debugLog("[session] removed active user", ws.__user_id);
+    }
+  });
+  ws.on("error", () => {
+    releaseTurn(ws);
+    removeFromRooms(ws);
+    if (ws.__user_id && activeUsers.get(ws.__user_id) === ws) {
+      activeUsers.delete(ws.__user_id);
+    }
+  });
 });
 
 setInterval(() => {
