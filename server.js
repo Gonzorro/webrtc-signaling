@@ -28,6 +28,197 @@ const supabase = process.env.SUPABASE_URL
 const rooms = Object.create(null);
 const activeUsers = new Map();
 
+const FEATURED_ROOMS_CONFIG = {
+  "movie-trailers": {
+    password: "",
+    maxClients: 4,
+    videoFile: "/opt/videos/spiderman-trailer.mp4",
+    displayName: "RawCast Theater",
+  }
+};
+const featuredInstances = Object.create(null);
+
+const CHUNK_SIZE = 65536;
+const META_MAGIC = 0x43484B4D;
+const CHUNK_MAGIC = 0x43484B53;
+const RESUME_MAGIC = 0x52455355;
+const STREAM_DELAY_MS = 2;
+const BACKPRESSURE_BYTES = 262144;
+
+class VideoStreamer {
+  constructor(clientWs, virtualHostId, videoPath) {
+    this.clientWs = clientWs;
+    this.virtualHostId = virtualHostId;
+    this.videoPath = videoPath;
+    this.fileSize = 0;
+    this.totalChunks = 0;
+    this.currentChunk = 0;
+    this.active = false;
+    this._idHeader = null;
+    try {
+      this.fileSize = fs.statSync(videoPath).size;
+      this.totalChunks = Math.ceil(this.fileSize / CHUNK_SIZE);
+      const idBuf = Buffer.from(virtualHostId, "utf8");
+      this._idHeader = Buffer.alloc(2 + idBuf.length);
+      this._idHeader.writeUInt16BE(idBuf.length, 0);
+      idBuf.copy(this._idHeader, 2);
+    } catch (e) {
+      console.error("[featured] VideoStreamer init error:", e.message);
+    }
+  }
+
+  sendMeta() {
+    const filename = nodePath.basename(this.videoPath);
+    const filenameBuf = Buffer.from(filename, "utf8");
+    const meta = Buffer.alloc(29 + filenameBuf.length);
+    meta.writeUInt32BE(META_MAGIC, 0);
+    const hi = Math.floor(this.fileSize / 0x100000000);
+    const lo = this.fileSize >>> 0;
+    meta.writeUInt32BE(hi, 4);
+    meta.writeUInt32BE(lo, 8);
+    meta.writeUInt32BE(CHUNK_SIZE, 12);
+    meta.writeUInt32BE(0, 16);
+    meta.writeUInt32BE(0, 20);
+    meta.writeUInt32BE(0, 24);
+    meta[28] = 0;
+    filenameBuf.copy(meta, 29);
+    this._sendFrame(meta);
+    debugLog("[featured] sent META to", this.clientWs.__id, "file=", filename, "size=", this.fileSize, "chunks=", this.totalChunks);
+  }
+
+  handleResumeAck(data) {
+    if (data.length < 8) return;
+    const magic = data.readUInt32BE(0);
+    if (magic !== RESUME_MAGIC) return;
+    const startChunk = data.readUInt32BE(4);
+    debugLog("[featured] RESUME_ACK from", this.clientWs.__id, "startChunk=", startChunk);
+    if (startChunk === 0x7FFFFFFF) return;
+    this.startStreaming(startChunk);
+  }
+
+  startStreaming(startChunk) {
+    this.currentChunk = startChunk;
+    this.active = true;
+    this._streamLoop();
+  }
+
+  async _streamLoop() {
+    let fd;
+    try { fd = fs.openSync(this.videoPath, "r"); } catch (e) {
+      console.error("[featured] cannot open video:", e.message);
+      this.active = false;
+      return;
+    }
+    const buf = Buffer.alloc(CHUNK_SIZE);
+    debugLog("[featured] streaming started for", this.clientWs.__id, "from chunk", this.currentChunk, "/", this.totalChunks);
+    while (this.active && this.currentChunk < this.totalChunks) {
+      if (!this.clientWs || this.clientWs.readyState !== WebSocket.OPEN) { this.active = false; break; }
+      const offset = this.currentChunk * CHUNK_SIZE;
+      let bytesRead;
+      try { bytesRead = fs.readSync(fd, buf, 0, CHUNK_SIZE, offset); } catch { break; }
+      const header = Buffer.alloc(12);
+      header.writeUInt32BE(CHUNK_MAGIC, 0);
+      header.writeUInt32BE(this.currentChunk, 4);
+      header.writeUInt32BE(this.totalChunks, 8);
+      const chunk = Buffer.concat([header, buf.subarray(0, bytesRead)]);
+      this._sendFrame(chunk);
+      this.currentChunk++;
+      const buffered = this.clientWs.bufferedAmount || 0;
+      if (buffered > BACKPRESSURE_BYTES) {
+        await new Promise(r => setTimeout(r, 50));
+      } else {
+        await new Promise(r => setTimeout(r, STREAM_DELAY_MS));
+      }
+    }
+    try { fs.closeSync(fd); } catch {}
+    if (this.active) debugLog("[featured] streaming complete for", this.clientWs.__id, "chunks=", this.currentChunk);
+    this.active = false;
+  }
+
+  stop() { this.active = false; }
+
+  _sendFrame(payload) {
+    if (!this._idHeader || !this.clientWs || this.clientWs.readyState !== WebSocket.OPEN) return;
+    const frame = Buffer.concat([this._idHeader, payload]);
+    try { this.clientWs.send(frame, { binary: true }); } catch {}
+  }
+}
+
+class FeaturedRoom {
+  constructor(roomId, config) {
+    this.roomId = roomId;
+    this.baseName = roomId.replace(/-\d+$/, "");
+    this.config = config;
+    this.__id = "__server_" + roomId + "__";
+    this.__display_name = config.displayName || "RawCast";
+    this.__guest = false;
+    this.__room = roomId;
+    this.__role = "host";
+    this.readyState = 1;
+    this._streamers = new Map();
+  }
+  send() {}
+  ping() {}
+  close() {}
+  get isAlive() { return true; }
+  set isAlive(_v) {}
+
+  onClientJoined(clientWs) {
+    const streamer = new VideoStreamer(clientWs, this.__id, this.config.videoFile);
+    this._streamers.set(clientWs.__id, streamer);
+    setTimeout(() => {
+      if (clientWs.readyState === WebSocket.OPEN) streamer.sendMeta();
+    }, 500);
+  }
+
+  onClientLeft(clientId) {
+    const streamer = this._streamers.get(clientId);
+    if (streamer) { streamer.stop(); this._streamers.delete(clientId); }
+  }
+
+  handleClientBinary(clientId, payload) {
+    const streamer = this._streamers.get(clientId);
+    if (streamer) streamer.handleResumeAck(payload);
+  }
+}
+
+function isFeaturedHost(host) { return host instanceof FeaturedRoom; }
+
+function createFeaturedInstance(baseName, instanceNum) {
+  const config = FEATURED_ROOMS_CONFIG[baseName];
+  if (!config) return null;
+  const roomId = instanceNum === 1 ? baseName : baseName + "-" + instanceNum;
+  const featured = new FeaturedRoom(roomId, config);
+  rooms[roomId] = { host: featured, clients: new Map(), password: config.password || "", featured: true };
+  if (!featuredInstances[baseName]) featuredInstances[baseName] = [];
+  featuredInstances[baseName].push(roomId);
+  debugLog("[featured] created instance", roomId);
+  return roomId;
+}
+
+function findFeaturedInstance(baseName) {
+  const config = FEATURED_ROOMS_CONFIG[baseName];
+  if (!config) return null;
+  const instances = featuredInstances[baseName] || [];
+  for (const roomId of instances) {
+    const info = rooms[roomId];
+    if (info && info.clients.size < config.maxClients) return roomId;
+  }
+  return createFeaturedInstance(baseName, instances.length + 1);
+}
+
+function initFeaturedRooms() {
+  for (const baseName of Object.keys(FEATURED_ROOMS_CONFIG)) {
+    const config = FEATURED_ROOMS_CONFIG[baseName];
+    if (!fs.existsSync(config.videoFile)) {
+      console.error("[featured] WARNING: video file not found:", config.videoFile);
+      continue;
+    }
+    createFeaturedInstance(baseName, 1);
+    console.log("[featured] initialized", baseName, "video=", config.videoFile);
+  }
+}
+
 const turnUsername = process.env.TURN_USERNAME || "";
 const turnCredential = process.env.TURN_CREDENTIAL || "";
 const turnGroups = [];
@@ -101,6 +292,26 @@ function closeRoomIfEmpty(room, info) {
   }
 }
 
+function cleanupFeaturedClient(room, info, leaverId) {
+  if (info.clients.has(leaverId)) {
+    const featured = info.host;
+    featured.onClientLeft(leaverId);
+    info.clients.delete(leaverId);
+    for (const [, cws] of info.clients) {
+      safeSend(cws, { type: "peer-left", room, id: leaverId });
+    }
+    debugLog("[featured] client left", leaverId, "room", room, "remaining=", info.clients.size);
+    const baseName = featured.baseName;
+    const instances = featuredInstances[baseName] || [];
+    if (info.clients.size === 0 && instances.length > 1 && instances[0] !== room) {
+      delete rooms[room];
+      const idx = instances.indexOf(room);
+      if (idx >= 0) instances.splice(idx, 1);
+      debugLog("[featured] overflow instance removed", room);
+    }
+  }
+}
+
 function removeFromRooms(leaver) {
   const room = getPeerRoom(leaver);
   const leaverId = getPeerId(leaver);
@@ -111,6 +322,13 @@ function removeFromRooms(leaver) {
   }
 
   const info = rooms[room];
+
+  if (info.featured && isFeaturedHost(info.host)) {
+    cleanupFeaturedClient(room, info, leaverId);
+    leaver.__room = "";
+    leaver.__role = "";
+    return;
+  }
 
   if (info.host === leaver) {
     const nextEntry = info.clients.entries().next();
@@ -162,8 +380,9 @@ const server = http.createServer((req, res) => {
       var info = rooms[r];
       var clientCount = info.clients ? info.clients.size : 0;
       var hostName = info.host ? (info.host.__display_name || "unknown") : "none";
-      roomList.push({ room: r, host: hostName, clients: clientCount });
-      totalPlayers += 1 + clientCount;
+      var isFeatured = !!info.featured;
+      roomList.push({ room: r, host: hostName, clients: clientCount, featured: isFeatured });
+      totalPlayers += (isFeatured ? 0 : 1) + clientCount;
     }
     var wsCount = 0;
     wss.clients.forEach(function() { wsCount++; });
@@ -451,7 +670,7 @@ wss.on("connection", (ws) => {
       senderIdBuf.copy(header, 2);
       const forwarded = Buffer.concat([header, payload]);
       if (flags === 0x01) {
-        if (info.host && info.host !== ws) safeSendBinary(info.host, forwarded);
+        if (info.host && info.host !== ws && !isFeaturedHost(info.host)) safeSendBinary(info.host, forwarded);
         for (const [, cws] of info.clients) {
           if (cws !== ws) safeSendBinary(cws, forwarded);
         }
@@ -459,7 +678,11 @@ wss.on("connection", (ws) => {
         let target = null;
         if (targetId === "host" || targetId === getPeerId(info.host)) target = info.host;
         else target = info.clients.get(targetId);
-        if (target) safeSendBinary(target, forwarded);
+        if (target && isFeaturedHost(target)) {
+          target.handleClientBinary(senderId, payload);
+        } else if (target) {
+          safeSendBinary(target, forwarded);
+        }
       }
       return;
     }
@@ -494,6 +717,28 @@ wss.on("connection", (ws) => {
         ws.__turn_ip = best.ip;
       }
       const room = msg.room;
+
+      if (FEATURED_ROOMS_CONFIG[room]) {
+        const instanceId = findFeaturedInstance(room);
+        if (!instanceId) { safeSend(ws, { type: "error", reason: "room_not_found" }); return; }
+        const fInfo = rooms[instanceId];
+        const featured = fInfo.host;
+        const peers = [{ id: featured.__id, display_name: featured.__display_name, role: "host", guest: false }];
+        for (const [cid, cws] of fInfo.clients) {
+          peers.push({ id: cid, display_name: cws.__display_name || "", role: "client", guest: !!cws.__guest });
+        }
+        fInfo.clients.set(ws.__id, ws);
+        ws.__room = instanceId;
+        ws.__role = "client";
+        debugLog("[featured] client joined", instanceId, "id=", ws.__id, "count=", fInfo.clients.size);
+        safeSend(ws, { type: "join-ok", room: instanceId, role: "client", id: ws.__id, host_name: featured.__display_name, host_id: featured.__id, peers, guest: !!ws.__guest, server_hosted: true });
+        for (const [, cws] of fInfo.clients) {
+          if (cws !== ws) safeSend(cws, { type: "client-joined", room: instanceId, id: ws.__id, display_name: ws.__display_name || "", guest: !!ws.__guest });
+        }
+        featured.onClientJoined(ws);
+        return;
+      }
+
       const createMode = msg.create !== false;
       if (createMode) {
         if (ws.__guest) { safeSend(ws, { type: "error", reason: "guests_cannot_create" }); return; }
@@ -549,6 +794,7 @@ wss.on("connection", (ws) => {
       const room = typeof msg.room === "string" ? msg.room : getPeerRoom(ws);
       const info = getRoomInfo(room);
       if (!info) return;
+      if (info.featured) return;
       if (getPeerRole(ws) !== "host") return;
       const targetId = typeof msg.client_id === "string" ? msg.client_id : "";
       if (!targetId) return;
@@ -578,6 +824,7 @@ wss.on("connection", (ws) => {
       const room = typeof msg.room === "string" ? msg.room : getPeerRoom(ws);
       const info = getRoomInfo(room);
       if (!info) return;
+      if (info.featured) return;
       if (getPeerRole(ws) !== "client") return;
       if (ws.__guest) {
         safeSend(ws, { type: "error", reason: "guest_cannot_be_host" });
@@ -628,7 +875,7 @@ wss.on("connection", (ws) => {
       if (!info) return;
       const role = getPeerRole(ws);
       if (role === "client") {
-        if (info.host) safeSend(info.host, msg);
+        if (info.host && !isFeaturedHost(info.host)) safeSend(info.host, msg);
       } else if (role === "host") {
         const to = typeof msg.to === "string" ? msg.to : null;
         if (to) {
@@ -656,6 +903,7 @@ wss.on("connection", (ws) => {
       else target = info.clients.get(to);
 
       if (DEBUG) debugLog("[relay]", type, "room=", room, "from=", from, "to=", to, !!target);
+      if (target && isFeaturedHost(target)) return;
       if (target && target.readyState === WebSocket.OPEN) target.send(JSON.stringify(msg));
       return;
     }
@@ -686,4 +934,5 @@ setInterval(() => {
   }
 }, INTERVAL_MS);
 
+initFeaturedRooms();
 server.listen(PORT, () => console.log(`Signaling server running on port ${PORT}`));
